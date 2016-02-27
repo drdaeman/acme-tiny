@@ -39,13 +39,10 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
             out.decode('utf8'), re.MULTILINE|re.DOTALL).groups()
         pub_exp = "{0:x}".format(int(pub_exp))
         pub_exp = "0{0}".format(pub_exp) if len(pub_exp) % 2 else pub_exp
-        header = {
-            "alg": "RS256",
-            "jwk": {
-                "e": _b64(binascii.unhexlify(pub_exp.encode("utf-8"))),
-                "kty": "RSA",
-                "n": _b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
-            },
+        jwk = {
+            "kty": "RSA",
+            "e": _b64(binascii.unhexlify(pub_exp.encode("utf-8"))),
+            "n": _b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
         }
     else:
         pub_hex = re.search(
@@ -56,15 +53,13 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         pub_hex = binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex.group(1)))
         if len(pub_hex) != 64:
             raise ValueError("Key error: public key has incorrect length")
-        header = {
-            "alg": "ES256",
-            "jwk": {
-                "kty": "EC",
-                "crv": "P-256",
-                "x": _b64(pub_hex[:32]),
-                "y": _b64(pub_hex[32:]),
-            },
+        jwk = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": _b64(pub_hex[:32]),
+            "y": _b64(pub_hex[32:]),
         }
+    header = {"alg": "ES256" if account_key_type == "ec" else "RS256", "jwk": jwk}
     accountkey_json = json.dumps(header['jwk'], sort_keys=True, separators=(',', ':'))
     thumbprint = _b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
 
