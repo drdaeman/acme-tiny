@@ -17,22 +17,21 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
     def _b64(b):
         return base64.urlsafe_b64encode(b).decode('utf8').replace("=", "")
 
+    def _openssl(*args, stdin=None):
+        proc = subprocess.Popen(["openssl"] + list(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(stdin)
+        if proc.returncode != 0:
+            raise IOError("OpenSSL Error: {0}".format(err))
+        return out
+
     # parse account key to get public key
     log.info("Parsing account key...")
     account_key_type = None
     with open(account_key, "r") as f:
-        for line in f:
-            m = re.match(r"^\s*-{5,}BEGIN\s+(EC|RSA)\s+PRIVATE\s+KEY-{5,}\s*$", line)
-            if m is not None:
-                account_key_type = m.group(1).lower()
-                break
+        account_key_type = re.match(r"-+BEGIN\s+(EC|RSA)\s+PRIVATE\s+KEY-+", f.read()).group(1).lower()
     if account_key_type not in ("rsa", "ec"):
         raise ValueError("Unknown key type. This tool supports RSA and ECDSA keys only")
-    proc = subprocess.Popen(["openssl", account_key_type, "-in", account_key, "-noout", "-text"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate()
-    if proc.returncode != 0:
-        raise IOError("OpenSSL Error: {0}".format(err))
+    out = _openssl(account_key_type, "-in", account_key, "-noout", "-text")
     if account_key_type == "rsa":
         pub_hex, pub_exp = re.search(
             r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)",
@@ -45,20 +44,10 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
             "n": _b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
         }
     else:
-        pub_hex = re.search(
+        pub_hex = binascii.unhexlify(re.sub(r"(\s|:)", "", re.search(
             r"pub:\s*\n\s+04:([a-f0-9\:\s]+?)\nASN1 OID: prime256v1\n",
-            out.decode('utf8'), re.MULTILINE|re.DOTALL)
-        if pub_hex is None:
-            raise ValueError("Invalid or incompatible key. Note, only prime256v1 is supported")
-        pub_hex = binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex.group(1)))
-        if len(pub_hex) != 64:
-            raise ValueError("Key error: public key has incorrect length")
-        jwk = {
-            "kty": "EC",
-            "crv": "P-256",
-            "x": _b64(pub_hex[:32]),
-            "y": _b64(pub_hex[32:]),
-        }
+            out.decode('utf8'), re.MULTILINE|re.DOTALL).group(1)))
+        jwk = {"kty": "EC", "crv": "P-256", "x": _b64(pub_hex[:32]), "y": _b64(pub_hex[32:])}
     header = {"alg": "ES256" if account_key_type == "ec" else "RS256", "jwk": jwk}
     accountkey_json = json.dumps(header['jwk'], sort_keys=True, separators=(',', ':'))
     thumbprint = _b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
@@ -69,30 +58,12 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
         protected = copy.deepcopy(header)
         protected["nonce"] = urlopen(CA + "/directory").headers['Replay-Nonce']
         protected64 = _b64(json.dumps(protected).encode('utf8'))
-        proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", account_key],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate("{0}.{1}".format(protected64, payload64).encode('utf8'))
-        if proc.returncode != 0:
-            raise IOError("OpenSSL Error: {0}".format(err))
-
+        out = _openssl("dgst", "-sha256", "-sign", account_key, stdin="{0}.{1}".format(protected64, payload64).encode('utf8'))
         if account_key_type == "ec":
-            # ECDSA-with-SHA256 signatures consist of just two numbers (R || S),
-            # however OpenSSL returns them not raw but as a DER-encoded sequence.
-            proc = subprocess.Popen(["openssl", "asn1parse", "-inform", "DER"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out, err = proc.communicate(out)
-            if proc.returncode != 0:
-                raise IOError("OpenSSL Error: {0}".format(err))
-            signature = re.findall(r"prim:\s+INTEGER\s+:([0-9A-F]{64})\n", out.decode("utf8"))
-            if len(signature) != 2:
-                raise ValueError("Failed to generate signature: unexpected DER output")
-            signature = binascii.unhexlify(signature[0]) + binascii.unhexlify(signature[1])
-        else:
-            signature = out
-
+            out = out[4:4+out[3]][-32:] + out[4+out[3]+2:4+out[3]+3+out[4+out[3]+1]][-32:]
         data = json.dumps({
             "header": header, "protected": protected64,
-            "payload": payload64, "signature": _b64(signature),
+            "payload": payload64, "signature": _b64(out),
         })
         try:
             resp = urlopen(url, data.encode('utf8'))
@@ -102,11 +73,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
 
     # find domains
     log.info("Parsing CSR...")
-    proc = subprocess.Popen(["openssl", "req", "-in", csr, "-noout", "-text"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate()
-    if proc.returncode != 0:
-        raise IOError("Error loading {0}: {1}".format(csr, err))
+    out = _openssl("req", "-in", csr, "-noout", "-text")
     domains = set([])
     common_name = re.search(r"Subject:.*? CN=([^\s,;/]+)", out.decode('utf8'))
     if common_name is not None:
@@ -189,12 +156,9 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
 
     # get the new certificate
     log.info("Signing certificate...")
-    proc = subprocess.Popen(["openssl", "req", "-in", csr, "-outform", "DER"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    csr_der, err = proc.communicate()
+    csr_der = _openssl("req", "-in", csr, "-outform", "DER")
     code, result = _send_signed_request(CA + "/acme/new-cert", {
-        "resource": "new-cert",
-        "csr": _b64(csr_der),
+        "resource": "new-cert", "csr": _b64(csr_der),
     })
     if code != 201:
         raise ValueError("Error signing certificate: {0} {1}".format(code, result))
@@ -220,8 +184,7 @@ def main(argv):
             ===Example Crontab Renewal (once per month)===
             0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed.crt 2>> /var/log/acme_tiny.log
             ==============================================
-            """)
-    )
+            """))
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
     parser.add_argument("--csr", required=True, help="path to your certificate signing request")
     parser.add_argument("--acme-dir", required=True, help="path to the .well-known/acme-challenge/ directory")
